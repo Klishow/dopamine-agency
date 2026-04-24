@@ -1,8 +1,11 @@
+import express from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
 
-// Client profile database — keyed by Telegram chat ID
+const PORT = 3000;
+
+// ─── Client Profile Database (keyed by Telegram chat ID) ─────────────────────
 const clientProfiles = {
   "123456789": {
     name: "Carlos Méndez",
@@ -36,6 +39,7 @@ const clientProfiles = {
   },
 };
 
+// ─── MCP Server ───────────────────────────────────────────────────────────────
 const server = new McpServer({
   name: "dopamine-agency",
   version: "1.0.0",
@@ -81,5 +85,52 @@ server.tool(
   }
 );
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
+// ─── Express HTTP Server with SSE Transport ───────────────────────────────────
+const app = express();
+app.use(express.json());
+
+// Active SSE transports keyed by session ID
+const transports = {};
+
+// SSE connection endpoint — clients connect here to open a session
+app.get("/sse", async (req, res) => {
+  const transport = new SSEServerTransport("/messages", res);
+  transports[transport.sessionId] = transport;
+
+  res.on("close", () => {
+    delete transports[transport.sessionId];
+  });
+
+  await server.connect(transport);
+});
+
+// Message endpoint — clients POST JSON-RPC messages here
+app.post("/messages", async (req, res) => {
+  const sessionId = req.query.sessionId;
+  const transport = transports[sessionId];
+
+  if (!transport) {
+    return res.status(400).json({ error: "Session not found. Connect to /sse first." });
+  }
+
+  await transport.handlePostMessage(req, res);
+});
+
+// Health check
+app.get("/", (req, res) => {
+  res.json({
+    name: "dopamine-agency MCP server",
+    version: "1.0.0",
+    status: "running",
+    endpoints: {
+      sse: `http://localhost:${PORT}/sse`,
+      messages: `http://localhost:${PORT}/messages`,
+    },
+  });
+});
+
+app.listen(PORT, () => {
+  console.log(`✅ Dopamine Agency MCP server running on port ${PORT}`);
+  console.log(`   SSE endpoint  → http://localhost:${PORT}/sse`);
+  console.log(`   POST endpoint → http://localhost:${PORT}/messages`);
+});
