@@ -4,7 +4,12 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
 
-const PORT = process.env.PORT || 3000;
+// Log env at the very start so Railway deploy logs show the injected PORT
+console.log(`[startup] process.env.PORT = "${process.env.PORT}"`);
+
+const PORT = Number(process.env.PORT) || 3000;
+
+console.log(`[startup] Binding to port ${PORT}`);
 
 // ─── Client Profile Database (keyed by Telegram chat ID) ─────────────────────
 const clientProfiles = {
