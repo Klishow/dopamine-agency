@@ -119,14 +119,15 @@ function createMcpServer() {
     async ({ date, time, service }) => {
       console.log(`[tool] check_availability date=${date} time=${time}`);
       try {
-        // Try the active checkavailability webhook first, then getavailableslots
-        const result = await callWebhook("checkavailability", { date, time, service });
+        // n8n webhook expects raw_date and raw_time field names
+        const payload = { raw_date: date, raw_time: time ?? null, service: service ?? null };
+        const result = await callWebhook("checkavailability", payload);
         if (result.ok) {
           const msg = typeof result.data === "string" ? result.data : JSON.stringify(result.data, null, 2);
           return { content: [{ type: "text", text: `Availability for ${date}${time ? ` at ${time}` : ""}:\n\n${msg}` }] };
         }
-        // Fallback to the availability engine
-        const result2 = await callWebhook("getavailableslots", { date, time, service });
+        // Fallback to the availability engine (also uses raw_date / raw_time)
+        const result2 = await callWebhook("getavailableslots", payload);
         const msg2 = typeof result2.data === "string" ? result2.data : JSON.stringify(result2.data, null, 2);
         return { content: [{ type: "text", text: `Available slots for ${date}:\n\n${msg2}` }] };
       } catch (err) {
