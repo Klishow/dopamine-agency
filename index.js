@@ -1,14 +1,15 @@
-import express from "express";
 import cors from "cors";
+import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import { z } from "zod";
 
-// Log env at the very start so Railway deploy logs show the injected PORT
+// Log injected PORT immediately so Railway deploy logs confirm the value
 console.log(`[startup] process.env.PORT = "${process.env.PORT}"`);
-
 const PORT = Number(process.env.PORT) || 3000;
-
 console.log(`[startup] Binding to port ${PORT}`);
 
 // ─── Client Profile Database (keyed by Telegram chat ID) ─────────────────────
@@ -45,7 +46,7 @@ const clientProfiles = {
   },
 };
 
-// ─── MCP Server Factory (one instance per SSE session) ───────────────────────
+// ─── MCP Server Factory ───────────────────────────────────────────────────────
 function createMcpServer() {
   const server = new McpServer({
     name: "dopamine-agency",
@@ -55,18 +56,14 @@ function createMcpServer() {
   server.tool(
     "get_client_profile",
     "Returns the client profile (name, niche, tone, language) for a given Telegram chat ID.",
-    {
-      chat_id: z.string().describe("The Telegram chat ID of the client"),
-    },
+    { chat_id: z.string().describe("The Telegram chat ID of the client") },
     async ({ chat_id }) => {
       const profile = clientProfiles[chat_id];
-
       if (!profile) {
         return {
           content: [{ type: "text", text: `No client profile found for Telegram chat ID: ${chat_id}` }],
         };
       }
-
       const output = [
         `Client Profile`,
         `──────────────`,
@@ -75,7 +72,6 @@ function createMcpServer() {
         `Tone:     ${profile.tone}`,
         `Language: ${profile.language}`,
       ].join("\n");
-
       return { content: [{ type: "text", text: output }] };
     }
   );
@@ -84,12 +80,23 @@ function createMcpServer() {
 }
 
 // ─── Express App ─────────────────────────────────────────────────────────────
-const app = express();
+// createMcpExpressApp with host 0.0.0.0 skips localhost-only DNS rebinding
+// protection so Railway's proxy can reach the server
+const app = createMcpExpressApp({ host: "0.0.0.0" });
 
-// Trust Railway's reverse proxy so req.protocol returns https
 app.set("trust proxy", 1);
 
-// ── Health check FIRST — before all middleware so Railway probes always get 200
+// CORS for Voiceflow, n8n, and any other cloud client
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "mcp-session-id"],
+}));
+
+// Active transports keyed by session ID
+const transports = {};
+
+// ── Health check — registered first so Railway probes always get 200 ─────────
 app.get("/", (req, res) => {
   const base = process.env.PUBLIC_URL || `${req.protocol}://${req.get("host")}`;
   res.json({
@@ -98,35 +105,64 @@ app.get("/", (req, res) => {
     status: "running",
     activeSessions: Object.keys(transports).length,
     endpoints: {
-      sse: `${base}/sse`,
-      messages: `${base}/messages`,
+      streamableHttp: `${base}/mcp`,
+      sse_legacy: `${base}/sse`,
     },
   });
 });
 
-// CORS — allow all origins (Voiceflow, n8n, etc.)
-app.use(cors({
-  origin: "*",
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "mcp-session-id"],
-}));
+// ── Streamable HTTP transport — /mcp (protocol 2025-11-25, used by Voiceflow) ─
+app.all("/mcp", async (req, res) => {
+  console.log(`[MCP] ${req.method} from ${req.ip}`);
+  try {
+    const sessionId = req.headers["mcp-session-id"];
 
-app.use(express.json());
+    // Reuse existing session
+    if (sessionId && transports[sessionId] instanceof StreamableHTTPServerTransport) {
+      await transports[sessionId].handleRequest(req, res, req.body);
+      return;
+    }
 
-// Active transports keyed by session ID
-const transports = {};
+    // New session — must be an initialize POST
+    if (!sessionId && req.method === "POST" && isInitializeRequest(req.body)) {
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        onsessioninitialized: (sid) => {
+          console.log(`[MCP] Session initialized: ${sid}`);
+          transports[sid] = transport;
+        },
+      });
 
-// SSE endpoint — stays open for the lifetime of the session
+      transport.onclose = () => {
+        const sid = transport.sessionId;
+        if (sid && transports[sid]) {
+          console.log(`[MCP] Session closed: ${sid}`);
+          delete transports[sid];
+        }
+      };
+
+      await createMcpServer().connect(transport);
+      await transport.handleRequest(req, res, req.body);
+      return;
+    }
+
+    res.status(400).json({
+      jsonrpc: "2.0",
+      error: { code: -32000, message: "Bad Request: missing or invalid session" },
+      id: null,
+    });
+  } catch (err) {
+    console.error("[MCP] Error:", err);
+    if (!res.headersSent) res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ── Legacy SSE transport — /sse + /messages (protocol 2024-11-05) ─────────────
 app.get("/sse", async (req, res) => {
   console.log(`[SSE] New connection from ${req.ip}`);
-
-  // Disable nginx/Railway proxy buffering so the endpoint event
-  // is forwarded to the client immediately instead of being held in a buffer
   res.setHeader("X-Accel-Buffering", "no");
 
   const transport = new SSEServerTransport("/messages", res);
-  const server = createMcpServer();
-
   transports[transport.sessionId] = transport;
 
   res.on("close", () => {
@@ -135,27 +171,24 @@ app.get("/sse", async (req, res) => {
   });
 
   try {
-    // await is correct here — SSE is a long-lived connection;
-    // connect() sends the endpoint event immediately then keeps the stream open
-    await server.connect(transport);
+    await createMcpServer().connect(transport);
   } catch (err) {
-    console.error(`[SSE] connect error:`, err);
+    console.error("[SSE] connect error:", err);
     delete transports[transport.sessionId];
     if (!res.headersSent) res.status(500).end();
   }
 });
 
-// Message endpoint — receives JSON-RPC tool calls
 app.post("/messages", async (req, res) => {
   const sessionId = req.query.sessionId;
   const transport = transports[sessionId];
 
-  if (!transport) {
-    console.warn(`[POST] Unknown sessionId: ${sessionId}`);
+  if (!(transport instanceof SSEServerTransport)) {
+    console.warn(`[SSE] Unknown sessionId: ${sessionId}`);
     return res.status(400).json({ error: "Session not found. Connect to /sse first." });
   }
 
-  await transport.handlePostMessage(req, res);
+  await transport.handlePostMessage(req, res, req.body);
 });
 
 // Global error handler
@@ -164,9 +197,17 @@ app.use((err, req, res, _next) => {
   if (!res.headersSent) res.status(500).json({ error: "Internal server error" });
 });
 
-// Bind explicitly to 0.0.0.0 so Railway's proxy can reach the process
+// ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ Dopamine Agency MCP server running on port ${PORT}`);
-  console.log(`   SSE endpoint  → http://0.0.0.0:${PORT}/sse`);
-  console.log(`   POST endpoint → http://0.0.0.0:${PORT}/messages`);
+  console.log(`   Streamable HTTP → http://0.0.0.0:${PORT}/mcp  (Voiceflow / n8n)`);
+  console.log(`   SSE legacy      → http://0.0.0.0:${PORT}/sse`);
+});
+
+process.on("SIGINT", async () => {
+  for (const [sid, t] of Object.entries(transports)) {
+    try { await t.close(); } catch {}
+    delete transports[sid];
+  }
+  process.exit(0);
 });
