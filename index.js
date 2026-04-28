@@ -4,7 +4,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
 
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 // ─── Client Profile Database (keyed by Telegram chat ID) ─────────────────────
 const clientProfiles = {
@@ -137,14 +137,16 @@ app.post("/messages", async (req, res) => {
 
 // Health check
 app.get("/", (req, res) => {
+  const base = process.env.PUBLIC_URL ||
+    `${req.protocol}://${req.get("host")}`;
   res.json({
     name: "dopamine-agency MCP server",
     version: "1.0.0",
     status: "running",
     activeSessions: Object.keys(transports).length,
     endpoints: {
-      sse: `http://localhost:${PORT}/sse`,
-      messages: `http://localhost:${PORT}/messages`,
+      sse: `${base}/sse`,
+      messages: `${base}/messages`,
     },
   });
 });
