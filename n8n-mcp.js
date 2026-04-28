@@ -119,14 +119,23 @@ function createMcpServer() {
     async ({ date, time, service }) => {
       console.log(`[tool] check_availability date=${date} time=${time}`);
       try {
-        // n8n webhook expects raw_date and raw_time field names
-        const payload = { raw_date: date, raw_time: time ?? null, service: service ?? null };
+        // n8n expects raw_date in DD.MM.YYYY format and raw_time as HH:MM (both required)
+        // Normalize short Croatian date "15.5." → "15.5.2026"
+        let normalizedDate = date.trim();
+        if (/^\d{1,2}\.\d{1,2}\.?$/.test(normalizedDate)) {
+          const year = new Date().getFullYear();
+          normalizedDate = normalizedDate.replace(/\.$/, "") + "." + year;
+        }
+        // raw_time must be a non-empty string — default to "00:00" if omitted
+        const normalizedTime = (time ?? "").trim() || "00:00";
+
+        const payload = { raw_date: normalizedDate, raw_time: normalizedTime, service: service ?? null };
         const result = await callWebhook("checkavailability", payload);
         if (result.ok) {
           const msg = typeof result.data === "string" ? result.data : JSON.stringify(result.data, null, 2);
           return { content: [{ type: "text", text: `Availability for ${date}${time ? ` at ${time}` : ""}:\n\n${msg}` }] };
         }
-        // Fallback to the availability engine (also uses raw_date / raw_time)
+        // Fallback: availability engine also uses raw_date / raw_time
         const result2 = await callWebhook("getavailableslots", payload);
         const msg2 = typeof result2.data === "string" ? result2.data : JSON.stringify(result2.data, null, 2);
         return { content: [{ type: "text", text: `Available slots for ${date}:\n\n${msg2}` }] };
