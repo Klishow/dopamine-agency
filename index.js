@@ -58,12 +58,7 @@ function createMcpServer() {
 
       if (!profile) {
         return {
-          content: [
-            {
-              type: "text",
-              text: `No client profile found for Telegram chat ID: ${chat_id}`,
-            },
-          ],
+          content: [{ type: "text", text: `No client profile found for Telegram chat ID: ${chat_id}` }],
         };
       }
 
@@ -76,24 +71,35 @@ function createMcpServer() {
         `Language: ${profile.language}`,
       ].join("\n");
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: output,
-          },
-        ],
-      };
+      return { content: [{ type: "text", text: output }] };
     }
   );
 
   return server;
 }
 
-// ─── Express HTTP Server ──────────────────────────────────────────────────────
+// ─── Express App ─────────────────────────────────────────────────────────────
 const app = express();
 
-// CORS — allow all origins so Voiceflow, n8n, and any other cloud service can connect
+// Trust Railway's reverse proxy so req.protocol returns https
+app.set("trust proxy", 1);
+
+// ── Health check FIRST — before all middleware so Railway probes always get 200
+app.get("/", (req, res) => {
+  const base = process.env.PUBLIC_URL || `${req.protocol}://${req.get("host")}`;
+  res.json({
+    name: "dopamine-agency MCP server",
+    version: "1.0.0",
+    status: "running",
+    activeSessions: Object.keys(transports).length,
+    endpoints: {
+      sse: `${base}/sse`,
+      messages: `${base}/messages`,
+    },
+  });
+});
+
+// CORS — allow all origins (Voiceflow, n8n, etc.)
 app.use(cors({
   origin: "*",
   methods: ["GET", "POST", "OPTIONS"],
@@ -105,12 +111,12 @@ app.use(express.json());
 // Active transports keyed by session ID
 const transports = {};
 
-// SSE endpoint — each client connection gets its own McpServer instance
-app.get("/sse", async (req, res) => {
+// SSE endpoint — fire-and-forget connect so the route handler returns immediately
+app.get("/sse", (req, res) => {
   console.log(`[SSE] New connection from ${req.ip}`);
 
   const transport = new SSEServerTransport("/messages", res);
-  const server = createMcpServer(); // fresh instance per session
+  const server = createMcpServer();
 
   transports[transport.sessionId] = transport;
 
@@ -119,7 +125,12 @@ app.get("/sse", async (req, res) => {
     delete transports[transport.sessionId];
   });
 
-  await server.connect(transport);
+  // Do NOT await — SSE stays open indefinitely; fire and forget
+  server.connect(transport).catch((err) => {
+    console.error(`[SSE] connect error:`, err);
+    delete transports[transport.sessionId];
+    if (!res.headersSent) res.status(500).end();
+  });
 });
 
 // Message endpoint — receives JSON-RPC tool calls
@@ -135,24 +146,15 @@ app.post("/messages", async (req, res) => {
   await transport.handlePostMessage(req, res);
 });
 
-// Health check
-app.get("/", (req, res) => {
-  const base = process.env.PUBLIC_URL ||
-    `${req.protocol}://${req.get("host")}`;
-  res.json({
-    name: "dopamine-agency MCP server",
-    version: "1.0.0",
-    status: "running",
-    activeSessions: Object.keys(transports).length,
-    endpoints: {
-      sse: `${base}/sse`,
-      messages: `${base}/messages`,
-    },
-  });
+// Global error handler
+app.use((err, req, res, _next) => {
+  console.error("[Error]", err);
+  if (!res.headersSent) res.status(500).json({ error: "Internal server error" });
 });
 
-app.listen(PORT, () => {
+// Bind explicitly to 0.0.0.0 so Railway's proxy can reach the process
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ Dopamine Agency MCP server running on port ${PORT}`);
-  console.log(`   SSE endpoint  → http://localhost:${PORT}/sse`);
-  console.log(`   POST endpoint → http://localhost:${PORT}/messages`);
+  console.log(`   SSE endpoint  → http://0.0.0.0:${PORT}/sse`);
+  console.log(`   POST endpoint → http://0.0.0.0:${PORT}/messages`);
 });
