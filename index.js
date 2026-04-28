@@ -116,9 +116,13 @@ app.use(express.json());
 // Active transports keyed by session ID
 const transports = {};
 
-// SSE endpoint — fire-and-forget connect so the route handler returns immediately
-app.get("/sse", (req, res) => {
+// SSE endpoint — stays open for the lifetime of the session
+app.get("/sse", async (req, res) => {
   console.log(`[SSE] New connection from ${req.ip}`);
+
+  // Disable nginx/Railway proxy buffering so the endpoint event
+  // is forwarded to the client immediately instead of being held in a buffer
+  res.setHeader("X-Accel-Buffering", "no");
 
   const transport = new SSEServerTransport("/messages", res);
   const server = createMcpServer();
@@ -130,12 +134,15 @@ app.get("/sse", (req, res) => {
     delete transports[transport.sessionId];
   });
 
-  // Do NOT await — SSE stays open indefinitely; fire and forget
-  server.connect(transport).catch((err) => {
+  try {
+    // await is correct here — SSE is a long-lived connection;
+    // connect() sends the endpoint event immediately then keeps the stream open
+    await server.connect(transport);
+  } catch (err) {
     console.error(`[SSE] connect error:`, err);
     delete transports[transport.sessionId];
     if (!res.headersSent) res.status(500).end();
-  });
+  }
 });
 
 // Message endpoint — receives JSON-RPC tool calls
