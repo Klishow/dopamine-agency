@@ -8,4 +8,4 @@ cmds = ["npm install"]
 cmds = []
 
 [start]
-cmd = "node index.js"
+cmd = "node n8n-mcp.js"
