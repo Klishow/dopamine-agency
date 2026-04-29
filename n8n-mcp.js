@@ -107,38 +107,52 @@ function createMcpServer() {
   // ── 1. check_availability ──────────────────────────────────────────────────
   server.tool(
     "check_availability",
-    `Check Katarina's real-time availability for a specific date and time before confirming a booking.
-     Always call this FIRST when a client proposes a date/time.
-     Returns available slots or confirms if the requested time is free.
-     Uses the Google Calendar availability engine workflow.`,
+    `Use this tool ONLY when date, time, and service are all known.
+     Do not call this tool with only date.
+     If time or service is missing, ask the user first.
+     All three input variables are mandatory.
+     Checks Katarina's Google Calendar for the exact requested slot.`,
     {
-      date: z.string().describe("Date to check in Croatian short format (e.g. '15.5.' or '15.5.2026')"),
-      time: z.string().optional().describe("Specific time to check (e.g. '10:00'). Omit to get all free slots for that day."),
-      service: z.string().optional().describe("Service requested (e.g. 'vjenčanje', 'matura', 'svakodnevna šminka')"),
+      date:    z.string().describe("REQUIRED. Exact booking date in Croatian short format, e.g. '29.4.2026' or '29.04.2026'. Always include the year."),
+      time:    z.string().describe("REQUIRED. Exact booking time in 24h format, e.g. '10:00' or '13:00'. Never omit."),
+      service: z.string().describe("REQUIRED. Requested makeup service, e.g. 'dnevni make up', 'večernji make up', 'bridal make up', 'edukacija'."),
     },
     async ({ date, time, service }) => {
-      console.log(`[tool] check_availability date=${date} time=${time}`);
+      console.log(`[tool] check_availability called — date=${date}, time=${time}, service=${service}`);
+
+      // ── Validate all three fields are present ────────────────────────────
+      const missing = [];
+      if (!date?.trim())    missing.push("date");
+      if (!time?.trim())    missing.push("time");
+      if (!service?.trim()) missing.push("service");
+
+      if (missing.length > 0) {
+        const msg = `Missing required field(s): ${missing.join(", ")}. Ask the user for the missing ${missing.join(" and ")} before checking availability.`;
+        console.warn(`[tool] check_availability blocked — ${msg}`);
+        return { content: [{ type: "text", text: msg }] };
+      }
+
       try {
-        // n8n expects raw_date in DD.MM.YYYY format and raw_time as HH:MM (both required)
-        // Normalize short Croatian date "15.5." → "15.5.2026"
+        // Normalize short Croatian date "15.5." or "15.5" → "15.5.2026"
         let normalizedDate = date.trim();
         if (/^\d{1,2}\.\d{1,2}\.?$/.test(normalizedDate)) {
           const year = new Date().getFullYear();
           normalizedDate = normalizedDate.replace(/\.$/, "") + "." + year;
         }
-        // raw_time must be a non-empty string — default to "00:00" if omitted
-        const normalizedTime = (time ?? "").trim() || "00:00";
+        const normalizedTime = time.trim();
 
-        const payload = { raw_date: normalizedDate, raw_time: normalizedTime, service: service ?? null };
+        const payload = { raw_date: normalizedDate, raw_time: normalizedTime, service: service.trim() };
+        console.log(`[tool] check_availability → n8n payload: ${JSON.stringify(payload)}`);
+
         const result = await callWebhook("checkavailability", payload);
         if (result.ok) {
           const msg = typeof result.data === "string" ? result.data : JSON.stringify(result.data, null, 2);
-          return { content: [{ type: "text", text: `Availability for ${date}${time ? ` at ${time}` : ""}:\n\n${msg}` }] };
+          return { content: [{ type: "text", text: `Availability for ${normalizedDate} at ${normalizedTime} (${service}):\n\n${msg}` }] };
         }
-        // Fallback: availability engine also uses raw_date / raw_time
+        // Fallback to availability engine
         const result2 = await callWebhook("getavailableslots", payload);
         const msg2 = typeof result2.data === "string" ? result2.data : JSON.stringify(result2.data, null, 2);
-        return { content: [{ type: "text", text: `Available slots for ${date}:\n\n${msg2}` }] };
+        return { content: [{ type: "text", text: `Availability for ${normalizedDate} at ${normalizedTime}:\n\n${msg2}` }] };
       } catch (err) {
         return { content: [{ type: "text", text: `Could not check availability: ${err.message}. Please ask Katarina directly to confirm.` }] };
       }
